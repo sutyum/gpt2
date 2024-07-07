@@ -1,3 +1,4 @@
+import tiktoken
 import math
 from dataclasses import dataclass
 import torch
@@ -5,19 +6,7 @@ import torch.nn as nn
 from torch.nn import functional as F
 
 
-# batch_size = 64  # how many independent sequences will we process simultaneously
-# block_size = 256  # what is the maximum context length for predict
-# max_iters = 5000
-# eval_intervals = 500
-# learning_rate = 3e-4
-# device = "cuda" if torch.cuda.is_available() else "cpu"
-# eval_iters = 200
-# n_embd = 384
-# n_head = 6
-# n_layer = 6
-# dropout = 0.2
-
-debug = True
+debug = False
 debug_print = print if debug else lambda *args, **kwargs: None
 
 
@@ -71,13 +60,15 @@ class CausalSelfAttention(nn.Module):
         # e.g. in GPT-2 (124M), nh=12, hs=64, C=nh*hs=768 channels in the Transformer
 
         B, T, C = x.size()  # batch size, context size, n_embd
+        debug_print(f"{B=}, {T=}, {C=}")
 
         qkv = self.c_attn(x)
         debug_print(qkv.shape)
 
         # Split qkv into q, k and v
         # n_embd * 3 -> n_embd, n_embd, n_embd
-        q, k, v = qkv.chunk(3, dim=-1)
+        # q, k, v = qkv.chunk(3, dim=-1)
+        q, k, v = qkv.split(self.n_embd, dim=2)
         assert (
             q.size() == k.size() == v.size()  # == (B, T, C // 3)
         ), "q, k, v size mismatch"
@@ -98,12 +89,12 @@ class CausalSelfAttention(nn.Module):
         # k: B, nh, T, hs -> k^T: B, nh, hs, T
         # q*k^T = B, nh, T, hs * B, nh, hs, T = B, nh, T, T
         k_T = k.transpose(-2, -1)
-        sqrt_d_k = math.sqrt(q.size(-1))
-        attn = (q @ k_T) / sqrt_d_k
+        sqrt_d_k = 1.0 * math.sqrt(q.size(-1))
+        attn = (q @ k_T) * sqrt_d_k
 
         # Mask out the upper half of the dot product matrix, excluding the diagonal
         # In other words, we only want to consider the "past" context
-        attn = attn.masked_fill(self.bias[:, :, :, :] == 0, float("-inf"))
+        attn = attn.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
         attn = F.softmax(attn, dim=-1)
 
         # Apply the attention to the values
@@ -169,6 +160,52 @@ class GPT2(nn.Module):
         # linear layer for output before softmax
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
+        # weight sharing scheme
+        self.transformer.wte.weight = self.lm_head.weight
+
+        # initialize weights
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def forward(self, idx, targets=None):
+        # x: (batch_size, context_size) or (B, T)
+        B, T = idx.size()  # T <= context_size
+
+        assert T <= self.config.context_size, "Context size mismatch"
+
+        # word position embedding
+        pos = torch.arange(0, T, dtype=torch.long, device=idx.device)  # (T)
+        pos_emb = self.transformer.wpe(pos)  # (T, n_embd)
+
+        # word token embedding
+        tok_emb = self.transformer.wte(idx)  # (B, T, n_embd)
+
+        # (B, T, n_embd) there is broadcasting happening here
+        x = tok_emb + pos_emb
+
+        for block in self.transformer.h:
+            x = block(x)
+
+        x = self.transformer.ln_f(x)
+        logits = self.lm_head(x)  # (B, T, vocab_size)
+
+        loss = None
+
+        if targets is not None:
+            loss = F.cross_entropy(  # B * T x vocab_size
+                logits.view(-1, self.config.vocab_size),  # (B * T, vocab_size)
+                targets.view(-1),  # (B * T)
+            )
+
+        return logits, loss
+
     @classmethod
     def from_pretrained(cls, model_type: str):
         """Loads pretrained GPT-2 model weights from huggingface"""
@@ -176,7 +213,7 @@ class GPT2(nn.Module):
 
         from transformers import GPT2LMHeadModel
 
-        debug_print(f"Loading weights from pretrained gpt: {model_type}")
+        print(f"Loading weights from pretrained gpt: {model_type}")
 
         config_args = {
             "gpt2": dict(n_layer=12, n_head=12, n_embd=768),  # 124M params
@@ -234,66 +271,132 @@ class GPT2(nn.Module):
 
         return model
 
-    def forward(self, idx):
-        # x: (batch_size, context_size) or (B, T)
-        B, T = idx.size()  # T <= context_size
 
-        assert T <= self.config.context_size, "Context size mismatch"
+class DataLoaderLite:
+    def __init__(self, B, T):
+        self.B = B  # batch size
+        self.T = T  # context size
 
-        # word position embedding
-        pos = torch.arange(0, T, dtype=torch.long, device=idx.device)  # (T)
-        pos_emb = self.transformer.wpe(pos)  # (T, n_embd)
+        with open("input.txt", "r") as f:
+            text = f.read()
 
-        # word token embedding
-        tok_emb = self.transformer.wte(idx)  # (B, T, n_embd)
+        enc = tiktoken.get_encoding("gpt2")
+        tokens = enc.encode(text)
 
-        # (B, T, n_embd) there is broadcasting happening here
-        x = tok_emb + pos_emb
+        self.tokens = torch.tensor(tokens)
 
-        for block in self.transformer.h:
-            x = block(x)
+        print(f"loaded {len(self.tokens)} tokens")
+        print(f"1 epoch = {len(self.tokens) // (B * T)} batches")
 
-        x = self.transformer["ln_f"](x)
-        logits = self.lm_head(x)  # (B, T, vocab_size)
+        self.current_position = 0
 
-        return logits
+    def next_batch(self) -> tuple[torch.Tensor, torch.Tensor]:
+        B, T = self.B, self.T
+        buf = self.tokens[self.current_position : self.current_position + B * T + 1]
+        x = buf[:-1].view(B, T)  # Inputs
+        y = buf[1:].view(B, T)  # Targets
+
+        # advance the position in the tensor
+        self.current_position += B * T
+        # if loading the next batch would be out of bounds, reset
+        if self.current_position + (B * T + 1) > len(self.tokens):
+            self.current_position = 0
+
+        assert x.size() == y.size() == (B, T), "Size mismatch"
+
+        return x, y
 
 
 if __name__ == "__main__":
-    device = "mps"
+    # Check if we have a GPU
+    device = "cpu"
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = "mps"
+    print(f"using device: {device}")
 
-    config = GPTConfig()
-    model = GPT2(config)
+    # Set the random seed for reproducibility
+    torch.manual_seed(42)
+    torch.cuda.manual_seed(42)
+
+    # Instantiate the data loader
+    train_loader = DataLoaderLite(B=4, T=32)
+
+    model = GPT2(GPTConfig())
     model.to(device)
 
-    # debug_print(model)
+    # Training
+    losses = []
+    avg_losses = []
+    epochs = 5000
+    print(f"Training for {epochs} batches, {epochs * 4 * 32} tokens")
+    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+    x, y = train_loader.next_batch()
+    x, y = x.to(device), y.to(device)
+    for i in range(epochs):
+        x, y = train_loader.next_batch()
+        x, y = x.to(device), y.to(device)
 
-    x = torch.randint(0, 65, (64, 256))
-    debug_print(f"{x.shape=}")
-    x = x.to(device)
-    y = model(x)
-    debug_print(f"{y.shape=}")
+        optimizer.zero_grad()  # needed as pytorch accumulates gradients
 
-    model = GPT2.from_pretrained("gpt2")
-    # debug_print(model)
+        logits, loss = model(x, y)
+        debug_print(loss)
 
-    model.eval()  # Good practice to set the model to eval mode when not training
-    model.to(device)
+        loss.backward()
+        optimizer.step()
 
-    max_return_sequences = 5
-    max_length = 30
+        # print(f"step {i}, loss: {loss.item()}")
+        losses.append(loss.item())
 
-    # Generate text
-    import tiktoken
+        if i % 100 == 0:
+            with torch.no_grad():
+                last_n_losses = losses[-100:]
+                avg_loss = (
+                    sum(last_n_losses) / len(last_n_losses) if last_n_losses else 0
+                )
+                print(f"step {i}, avg loss: {avg_loss}")
+                avg_losses.append(avg_loss)
 
-    enc = tiktoken.get_encoding("gpt2")
-    tokens = enc.encode("Hello, my name is")
-    # long because in pytorch long is used for integer values
-    tokens = torch.tensor(tokens, dtype=torch.long)  # (T)
-    tokens = tokens.unsqueeze(0).repeat(max_return_sequences)  # (B, T)
-    # Without repeat, the tensor would be (1, T). We instead repeat it B times
-    # in order to sample B times for the same sequence
+    # Plot the loss
+    import matplotlib.pyplot as plt
 
-    tokens.to(device)
+    # plt.plot(losses)
+    plt.plot(avg_losses)
+    plt.savefig("loss.png")
 
-    print(tokens.shape)
+    import sys
+
+    sys.exit(0)
+
+    # while x.size(1) < max_length:
+    #     with torch.no_grad():
+    #         logits = model(x)  # (B, T, vocab_size)
+
+    #         # take the logits of the last token
+    #         logits = logits[:, -1, :]  # (B, vocab_size)
+
+    #         # Get the probability distribution
+    #         probs = F.softmax(logits, dim=-1)  # (B, vocab_size)
+
+    #         # Sample the next token
+    #         # top-k sampling of 50 tokens so we end up with (B, 50)
+    #         top_k = 50
+    #         topk_probs, topk_indices = torch.topk(probs, top_k, dim=-1)
+
+    #         # select a token from the top-k probabilities
+    #         next_token = torch.multinomial(topk_probs, 1)  # (B, 1)
+
+    #         # Gather corresponding indices
+    #         xcol = torch.gather(topk_indices, -1, next_token)
+
+    #         # Append to the sequence
+    #         debug_print(x.shape, xcol.shape)
+    #         x = torch.cat((x, xcol), dim=1)
+    #         debug_print(x.shape)
+
+    # # Decode the tokens
+    # for i in range(max_return_sequences):
+    #     tokens = x[i, :max_length].tolist()
+    #     decoded = enc.decode(tokens)
+    #     print(">", decoded)
