@@ -94,14 +94,18 @@ class CausalSelfAttention(nn.Module):
         sqrt_d_k = 1.0 * math.sqrt(q.size(-1))
         attn = (q @ k_T) * sqrt_d_k
 
-        # Mask out the upper half of the dot product matrix, excluding the diagonal
-        # In other words, we only want to consider the "past" context
-        attn = attn.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
-        attn = F.softmax(attn, dim=-1)
+        # # Baseline
+        # # Mask out the upper half of the dot product matrix, excluding the diagonal
+        # # In other words, we only want to consider the "past" context
+        # attn = attn.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
+        # attn = F.softmax(attn, dim=-1)
+        # 
+        # # Apply the attention to the values
+        # y = attn @ v  # B, nh, T, T @ B, nh, T, hs = B, nh, T, hs
+        # # Weighted average of the values with the attention scores
 
-        # Apply the attention to the values
-        y = attn @ v  # B, nh, T, T @ B, nh, T, hs = B, nh, T, hs
-        # Weighted average of the values with the attention scores
+        # SPEED!: flash attention
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
 
         y = y.transpose(1, 2)  # B, T, nh, hs
         # contiguous() is required because of the transpose because it doesn't change the memory layout
@@ -131,12 +135,12 @@ class Block(nn.Module):
 
 @dataclass
 class GPTConfig:
-    context_size: int = 256  # block size is just the context size
+    context_size: int = 1024  # block size is just the context size
     # 64 because: [PAD], [SOS], [EOS], [MASK], [UNK] + 60 characters
-    vocab_size: int = 65
-    n_layer: int = 6
-    n_head: int = 6
-    n_embd: int = 384
+    vocab_size: int = 50257 # 50,000 BPE merges + 256 bytes tokens + 1 <|endoftext|> token
+    n_layer: int = 12
+    n_head: int = 12
+    n_embd: int = 768
     debug: bool = False
 
 
@@ -310,6 +314,7 @@ class DataLoaderLite:
         self.current_position += B * T
         # if loading the next batch would be out of bounds, reset
         if self.current_position + (B * T + 1) > len(self.tokens):
+            print("\n\t!!! Dataset Loop Completed !!!\n")
             self.current_position = 0
 
         assert x.size() == y.size() == (B, T), "Size mismatch"
@@ -336,18 +341,23 @@ if __name__ == "__main__":
     # Instantiate the data loader
     train_loader = DataLoaderLite(B=8, T=1024)
 
-    torch.set_float32_matmul_precision("high")
+    # SPEED!: Use TF32
+    torch.set_float32_matmul_precision("high") # Use TF32 on GPUs which support it
 
-    model = GPT2(GPTConfig(vocab_size=50257, context_size=1024))
+    # SPEED!: all numbers powers of 2
+    model = GPT2(GPTConfig(vocab_size=50304, context_size=1024))
+    # model = GPT2(GPTConfig()) # Baseline
     model.to(device)
+    # SPEED!: Torch Compile
+    model = torch.compile(model)
 
     # Training
     losses = []
     avg_losses = []
-    epochs = 200
+    epochs = 100
     # moving_window_length = 200
 
-    print(f"Training for {epochs} epochs, {model.config.context_size * 8 * 82} tokens")
+    print(f"Training for {epochs} epochs, {model.config.context_size * 16 * 20} tokens")
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 
     for i in range(epochs):
@@ -357,7 +367,12 @@ if __name__ == "__main__":
 
         optimizer.zero_grad()  # needed as pytorch accumulates gradients
 
-        logits, loss = model(x, y)
+        # SPEED!: autocast to bfloat16
+        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+          logits, loss = model(x, y)
+          # import code; code.interact(locals=locals())
+        # logits, loss = model(x, y) # Baseline
+
         loss.backward()
         optimizer.step()
         torch.cuda.synchronize() # Wait for GPUs to complete the above queued up tasks
