@@ -163,10 +163,13 @@ class GPT2(nn.Module):
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
         # weight sharing scheme
+        # print(self.transformer.wte.weight.shape, type(self.transformer.wte))
         self.transformer.wte.weight = self.lm_head.weight
+        # print(self.transformer.wte.weight.shape, type(self.transformer.wte))
 
         # initialize weights
         self.apply(self._init_weights)
+        # print(self.transformer.wte.weight.shape, type(self.transformer.wte))
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -178,8 +181,10 @@ class GPT2(nn.Module):
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        
+        # assert torch._check_tensor_all(self.transformer.wte.weight == self.lm_head.weight, "All must be identical")
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets=None):    
         # x: (batch_size, context_size) or (B, T)
         B, T = idx.size()  # T <= context_size
 
@@ -312,6 +317,8 @@ class DataLoaderLite:
         return x, y
 
 
+import time
+
 if __name__ == "__main__":
     # Check if we have a GPU
     device = "cpu"
@@ -327,53 +334,54 @@ if __name__ == "__main__":
         torch.cuda.manual_seed(1337)
 
     # Instantiate the data loader
-    train_loader = DataLoaderLite(B=4, T=32)
+    train_loader = DataLoaderLite(B=4, T=1024)
 
-    model = GPT2(GPTConfig())
+    model = GPT2(GPTConfig(vocab_size=50257, context_size=1024))
     model.to(device)
 
     # Training
     losses = []
     avg_losses = []
-    epochs = 50
-    moving_window_length = 200
+    epochs = 3
+    # moving_window_length = 200
 
-    print(f"Training for {epochs} batches, {epochs * 4 * 32} tokens")
+    print(f"Training for {epochs} epochs, {model.config.context_size * 4 * 82} tokens")
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
-    x, y = train_loader.next_batch()
-    x, y = x.to(device), y.to(device)
+    # x, y = train_loader.next_batch()
+    # x, y = x.to(device), y.to(device)
     for i in range(epochs):
-        x, y = train_loader.next_batch()
-        x, y = x.to(device), y.to(device)
+        for b in range(82): # 1 epoch on this dataset is 82 batches of B=4, T=1024
+          x, y = train_loader.next_batch()
+          x, y = x.to(device), y.to(device)
 
-        optimizer.zero_grad()  # needed as pytorch accumulates gradients
+          optimizer.zero_grad()  # needed as pytorch accumulates gradients
 
-        logits, loss = model(x, y)
-        debug_print(loss)
+          logits, loss = model(x, y)
+          debug_print(loss)
 
-        loss.backward()
-        optimizer.step()
+          loss.backward()
+          optimizer.step()
 
-        print(f"step {i}, loss: {loss.item()}")
-        losses.append(loss.item())
+          print(f"step {i*82 + b}, loss: {loss.item()}")
+          losses.append(loss.item())
 
-        if i % moving_window_length == 0:
-            # Calculate the average loss over the last n steps
+          # if i % moving_window_length == 0:
+          #     # Calculate the average loss over the last n steps
 
-            with torch.no_grad():
-                last_n_losses = losses[-moving_window_length:]
-                avg_loss = (
-                    sum(last_n_losses) / len(last_n_losses) if last_n_losses else 0
-                )
+          #     with torch.no_grad():
+          #         last_n_losses = losses[-moving_window_length:]
+          #         avg_loss = (
+          #             sum(last_n_losses) / len(last_n_losses) if last_n_losses else 0
+          #         )
 
-                print(f"  ... step {i}, avg loss: {avg_loss}")
-                avg_losses.append(avg_loss)
+          #         print(f"  ... step {i}, avg loss: {avg_loss}")
+          #         avg_losses.append(avg_loss)
 
     # Plot the loss
     import matplotlib.pyplot as plt
 
-    # plt.plot(losses)
-    plt.plot(avg_losses)
+    plt.plot(losses)
+    # plt.plot(avg_losses)
     plt.savefig("loss.png")
 
     import sys
