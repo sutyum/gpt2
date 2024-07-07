@@ -19,6 +19,7 @@ class MLP(nn.Module):
         self.act = nn.GELU(approximate="tanh")
         # Linear Projection back to n_embd dimensions
         self.c_proj = nn.Linear(config.n_embd * 4, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -42,6 +43,7 @@ class CausalSelfAttention(nn.Module):
         # Linear projection matrices for the query, key, and value vectors as a single matrix
         self.c_attn = nn.Linear(config.n_embd, config.n_embd * 3)
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
 
         # Mask
         self.register_buffer(
@@ -168,7 +170,10 @@ class GPT2(nn.Module):
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            std = 0.02
+            if hasattr(module, "NANOGPT_SCALE_INIT"):
+                std *= (2 * self.config.n_layer) ** -0.5
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
@@ -317,8 +322,9 @@ if __name__ == "__main__":
     print(f"using device: {device}")
 
     # Set the random seed for reproducibility
-    torch.manual_seed(42)
-    torch.cuda.manual_seed(42)
+    torch.manual_seed(1337)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(1337)
 
     # Instantiate the data loader
     train_loader = DataLoaderLite(B=4, T=32)
@@ -329,7 +335,9 @@ if __name__ == "__main__":
     # Training
     losses = []
     avg_losses = []
-    epochs = 5000
+    epochs = 50
+    moving_window_length = 200
+
     print(f"Training for {epochs} batches, {epochs * 4 * 32} tokens")
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
     x, y = train_loader.next_batch()
@@ -346,16 +354,19 @@ if __name__ == "__main__":
         loss.backward()
         optimizer.step()
 
-        # print(f"step {i}, loss: {loss.item()}")
+        print(f"step {i}, loss: {loss.item()}")
         losses.append(loss.item())
 
-        if i % 100 == 0:
+        if i % moving_window_length == 0:
+            # Calculate the average loss over the last n steps
+
             with torch.no_grad():
-                last_n_losses = losses[-100:]
+                last_n_losses = losses[-moving_window_length:]
                 avg_loss = (
                     sum(last_n_losses) / len(last_n_losses) if last_n_losses else 0
                 )
-                print(f"step {i}, avg loss: {avg_loss}")
+
+                print(f"  ... step {i}, avg loss: {avg_loss}")
                 avg_losses.append(avg_loss)
 
     # Plot the loss
