@@ -334,7 +334,9 @@ if __name__ == "__main__":
         torch.cuda.manual_seed(1337)
 
     # Instantiate the data loader
-    train_loader = DataLoaderLite(B=4, T=1024)
+    train_loader = DataLoaderLite(B=8, T=1024)
+
+    torch.set_float32_matmul_precision("high")
 
     model = GPT2(GPTConfig(vocab_size=50257, context_size=1024))
     model.to(device)
@@ -342,40 +344,40 @@ if __name__ == "__main__":
     # Training
     losses = []
     avg_losses = []
-    epochs = 3
+    epochs = 200
     # moving_window_length = 200
 
-    print(f"Training for {epochs} epochs, {model.config.context_size * 4 * 82} tokens")
+    print(f"Training for {epochs} epochs, {model.config.context_size * 8 * 82} tokens")
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
-    # x, y = train_loader.next_batch()
-    # x, y = x.to(device), y.to(device)
+
     for i in range(epochs):
-        for b in range(82): # 1 epoch on this dataset is 82 batches of B=4, T=1024
-          x, y = train_loader.next_batch()
-          x, y = x.to(device), y.to(device)
+        t0 = time.time()
+        x, y = train_loader.next_batch()
+        x, y = x.to(device), y.to(device)
 
-          optimizer.zero_grad()  # needed as pytorch accumulates gradients
+        optimizer.zero_grad()  # needed as pytorch accumulates gradients
 
-          logits, loss = model(x, y)
-          debug_print(loss)
+        logits, loss = model(x, y)
+        loss.backward()
+        optimizer.step()
+        torch.cuda.synchronize() # Wait for GPUs to complete the above queued up tasks
 
-          loss.backward()
-          optimizer.step()
+        t1 = time.time()
+        dt = (t1 - t0) * 1000 # milliseconds
+        tps = (train_loader.B * train_loader.T) * (t1 - t0)
+        print(f"step {i}, loss = {loss}, dt = {dt}, tokens/sec = {tps}")
 
-          print(f"step {i*82 + b}, loss: {loss.item()}")
-          losses.append(loss.item())
+        losses.append(loss.item())
 
-          # if i % moving_window_length == 0:
-          #     # Calculate the average loss over the last n steps
-
-          #     with torch.no_grad():
-          #         last_n_losses = losses[-moving_window_length:]
-          #         avg_loss = (
-          #             sum(last_n_losses) / len(last_n_losses) if last_n_losses else 0
-          #         )
-
-          #         print(f"  ... step {i}, avg loss: {avg_loss}")
-          #         avg_losses.append(avg_loss)
+        # if i % moving_window_length == 0:
+        #     # Calculate the average loss over the last n steps
+        #     with torch.no_grad():
+        #         last_n_losses = losses[-moving_window_length:]
+        #         avg_loss = (
+        #             sum(last_n_losses) / len(last_n_losses) if last_n_losses else 0
+        #         )
+        #         print(f"  ... step {i}, avg loss: {avg_loss}")
+        #         avg_losses.append(avg_loss)
 
     # Plot the loss
     import matplotlib.pyplot as plt
