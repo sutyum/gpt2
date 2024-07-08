@@ -343,7 +343,7 @@ class DataLoaderLite:
         self.current_position += B * T
         # if loading the next batch would be out of bounds, reset
         if self.current_position + (B * T + 1) > len(self.tokens):
-            print("\n\t!!! Dataset Loop Completed !!!\n")
+            # print("\n\t!!! Dataset Loop Completed !!!\n")
             self.current_position = 0
 
         assert x.size() == y.size() == (B, T), "Size mismatch"
@@ -351,11 +351,10 @@ class DataLoaderLite:
         return x, y
 
 
-
 max_lr = 6e-4
 min_lr = max_lr * 0.1
 warmup_steps = 10
-max_steps = 500
+max_steps = 50
 
 def get_lr(it: int) -> float:
     # 1) linear warmup for warmup iter steps
@@ -379,20 +378,28 @@ if __name__ == "__main__":
         device = "mps"
     print(f"using device: {device}")
 
-    from torch.distributed import init_process_group, destroy_process_group
+    # from torch.distributed import init_process_group, destroy_process_group
 
     # set up DDP (distributed data parallel)
     # torchrun command sets the env variables RANK, LOCAL_RANK, and WORLD_SIZE
-    ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
-    print(ddp, os.environ.get('RANK'), os.environ.get('LOCAL_RANK'))
+    # ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
+    # print(ddp, os.environ.get('RANK'), os.environ.get('LOCAL_RANK'))
 
     # Set the random seed for reproducibility
     torch.manual_seed(1337)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(1337)
 
+    total_batch_size = 524_288 # 2**19, ~0.5M tokens, GPT 2's batch size
+    B = 32 # micro batch size (can fit on this GPU)
+    T = 1024 # sequence length
+    assert total_batch_size % (B * T) == 0, "make sure total_batch_size is divisible by B*T"
+    grad_accum_steps = total_batch_size // (B * T)
+    print(f"total desired batch size: {total_batch_size}")
+    print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
+
     # Instantiate the data loader
-    train_loader = DataLoaderLite(B=8, T=1024)
+    train_loader = DataLoaderLite(B=B, T=T)
 
     # SPEED!: Use TF32
     torch.set_float32_matmul_precision("high") # Use TF32 on GPUs which support it
@@ -418,18 +425,21 @@ if __name__ == "__main__":
 
     for step in range(max_steps):
         t0 = time.time()
-        x, y = train_loader.next_batch()
-        x, y = x.to(device), y.to(device)
-
         optimizer.zero_grad()  # needed as pytorch accumulates gradients
+        loss_accum = 0.0 # accumulate for microsteps for printing
+        for microstep in range(grad_accum_steps):
+            x, y = train_loader.next_batch()
+            x, y = x.to(device), y.to(device)
 
-        # SPEED!: autocast to bfloat16
-        with torch.autocast(device_type=device, dtype=torch.bfloat16):
-          logits, loss = model(x, y)
-          # import code; code.interact(locals=locals())
-        # logits, loss = model(x, y) # Baseline
+            # SPEED!: autocast to bfloat16
+            with torch.autocast(device_type=device, dtype=torch.bfloat16):
+              logits, loss = model(x, y)
+              # import code; code.interact(locals=locals())
+            # logits, loss = model(x, y) # Baseline
 
-        loss.backward()
+            loss = loss / grad_accum_steps # For gradient accumulation
+            loss_accum += loss.detach()
+            loss.backward()
         norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) # IMPROVEMENTS!: Normalize Gradients using norm of gradients
 
         # IMPROVEMENTS!: Cosine LR Scheduling
@@ -437,15 +447,16 @@ if __name__ == "__main__":
         lr = get_lr(step)
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
+
         optimizer.step()
         torch.cuda.synchronize() # Wait for GPUs to complete the above queued up tasks
 
         t1 = time.time()
         dt = (t1 - t0) * 1000 # milliseconds
-        tps = (train_loader.B * train_loader.T) * (t1 - t0)
-        print(f"step {step} | loss: {loss.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt = {dt} | tokens/sec: {tps}")
+        tps = (train_loader.B * train_loader.T * grad_accum_steps) / (t1 - t0)
+        print(f"step {step} | loss: {loss_accum.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt = {dt} | tokens/sec: {tps}")
 
-        losses.append(loss.item())
+        losses.append(loss_accum.item())
 
         # if i % moving_window_length == 0:
         #     # Calculate the average loss over the last n steps
