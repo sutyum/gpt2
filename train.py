@@ -417,7 +417,7 @@ if __name__ == "__main__":
         torch.cuda.manual_seed(1337)
 
     total_batch_size = 524_288 # 2**19, ~0.5M tokens, GPT 2's batch size
-    B = 32 # micro batch size (can fit on this GPU)
+    B = 2 # micro batch size (can fit on this GPU)
     T = 1024 # sequence length
     assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B*T"
     grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
@@ -436,7 +436,8 @@ if __name__ == "__main__":
     # model = GPT2(GPTConfig()) # Baseline
     model.to(device)
     # SPEED!: Torch Compile
-    model = torch.compile(model)
+    if device_type == 'cuda':
+      model = torch.compile(model)
 
     if ddp: # DDP
         model = DDP(model, device_ids=[ddp_local_rank])
@@ -464,10 +465,12 @@ if __name__ == "__main__":
             x, y = x.to(device), y.to(device)
 
             # SPEED!: autocast to bfloat16
-            with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                logits, loss = model(x, y)
+            if device_type == 'cuda':
+              with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                  logits, loss = model(x, y)
               # import code; code.interact(locals=locals())
-            # logits, loss = model(x, y) # Baseline
+            else:
+              logits, loss = model(x, y) # Baseline
 
             loss = loss / grad_accum_steps # For gradient accumulation
             loss_accum += loss.detach()
@@ -485,7 +488,10 @@ if __name__ == "__main__":
             param_group['lr'] = lr
 
         optimizer.step()
-        torch.cuda.synchronize() # Wait for GPUs to complete the above queued up tasks
+
+        # if device_type == 'cuda':
+        if ddp:
+          torch.cuda.synchronize() # Wait for GPUs to complete the above queued up tasks
 
         t1 = time.time()
         dt = (t1 - t0) * 1000 # milliseconds
