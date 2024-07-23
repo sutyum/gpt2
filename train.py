@@ -484,6 +484,7 @@ if __name__ == "__main__":
 
     # Instantiate the data loader
     train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train")
+    # val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train")
 
     # SPEED!: Use TF32
     torch.set_float32_matmul_precision("high") # Use TF32 on GPUs which support it
@@ -492,9 +493,9 @@ if __name__ == "__main__":
     model = GPT2(GPTConfig(vocab_size=50304, context_size=1024))
     # model = GPT2(GPTConfig()) # Baseline
     model.to(device)
-    # # SPEED!: Torch Compile
-    # if device_type == 'cuda':
-    #   model = torch.compile(model)
+    # SPEED!: Torch Compile
+    if device_type == 'cuda':
+      model = torch.compile(model)
 
     if ddp: # DDP
         model = DDP(model, device_ids=[ddp_local_rank])
