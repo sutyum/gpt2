@@ -8,6 +8,7 @@ import torch.nn as nn
 from torch.nn import functional as F
 import tiktoken
 import numpy as np
+import matplotlib.pyplot as plt
 
 
 debug = False
@@ -323,53 +324,6 @@ def load_tokens(filename):
     return ptt
 
 
-# class DataLoaderLite:
-#     def __init__(self, B, T, process_rank, num_processes, split):
-#         self.B = B  # batch size
-#         self.T = T  # context size
-#         self.process_rank = process_rank
-#         self.num_processes = num_processes
-
-#         assert split in {"train", "val"}, "The chosen split must be either train or split"
-
-#         # Get the shard filename
-#         data_root = os.path.join("/workspace", "edu_fineweb10B")
-#         shards = os.listdir(data_root)
-#         # print(shards)
-#         shards_for_split = [filename for filename in shards if split in filename]
-#         shards_for_split = sorted(shards_for_split)
-#         self.shards = shards_for_split # Shard file names for the given split
-
-#         assert len(shards) > 0, f"no shard found in split {split}"
-#         if master_process:
-#             print(f"Total number of shards in the split {split} is {len(shards)}")
-
-#         self.reset()
-    
-#     def reset(self):
-#         # state, init at shard zero
-#         self.current_shard = 0
-#         self.tokens = load_tokens(self.shards[self.current_shard])
-#         self.current_position = self.B * self.T * self.process_rank
-
-#     def next_batch(self) -> tuple[torch.Tensor, torch.Tensor]:
-#         B, T = self.B, self.T
-#         buf = self.tokens[self.current_position : self.current_position + B * T + 1]
-#         x = buf[:-1].view(B, T)  # Inputs
-#         y = buf[1:].view(B, T)  # Targets
-
-#         # advance the position in the tensor
-#         self.current_position += B * T * self.num_processes
-#         # if loading the next batch would be out of bounds, reset
-#         if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
-#             self.current_shard = (self.current_shard + 1) % len(self.shards)
-#             self.tokens = load_tokens(self.shards[self.current_shard])
-#             self.current_position = self.B * self.T * self.process_rank
-
-#         assert x.size() == y.size() == (B, T), "Size mismatch"
-
-#         return x, y
-
 class DataLoaderLite:
     def __init__(self, B, T, process_rank, num_processes, split):
         self.B = B
@@ -414,7 +368,7 @@ class DataLoaderLite:
 max_lr = 6e-4
 min_lr = max_lr * 0.1
 warmup_steps = 10
-max_steps = 50
+max_steps = 30
 
 def get_lr(it: int) -> float:
     # 1) linear warmup for warmup iter steps
@@ -428,6 +382,46 @@ def get_lr(it: int) -> float:
     assert 0 <= decay_ratio <= 1
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff starts at 1 and goes to 0
     return min_lr + coeff * (max_lr - min_lr)
+
+def calculate_validation_loss(model, val_loader, device, val_loss_steps):
+    model.eval()
+    val_loss_accum = 0.0
+    
+    with torch.no_grad():
+        for _ in range(val_loss_steps):
+            x, y = val_loader.next_batch()
+            x, y = x.to(device), y.to(device)
+            
+            logits, loss = model(x, y)
+            val_loss_accum += loss.item()  # Use .item() to get scalar value
+
+        if ddp:
+            dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
+    
+    return val_loss_accum / val_loss_steps
+
+def generate_text(model, enc, device, max_length=32, max_return_sequences=4):
+    model.eval()
+    tokens = enc.encode("Hello, I am a program which")
+    tokens = torch.tensor(tokens, dtype=torch.long)
+    tokens = tokens.unsqueeze(0).repeat(max_return_sequences, 1)
+    x_gen = tokens.to(device)
+
+    with torch.no_grad():
+        while x_gen.size(1) < max_length:
+            logits, _ = model(x_gen)
+            next_token_logits = logits[:, -1, :]
+            probs = F.softmax(next_token_logits, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1)
+            x_gen = torch.cat((x_gen, next_token), dim=1)
+
+    generated_sequences = []
+    for i in range(max_return_sequences):
+        tokens = x_gen[i, :].tolist()
+        decoded = enc.decode(tokens)
+        generated_sequences.append(decoded)
+
+    return generated_sequences
 
 if __name__ == "__main__":
     # DDP
@@ -484,7 +478,7 @@ if __name__ == "__main__":
 
     # Instantiate the data loader
     train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train")
-    # val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train")
+    val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train")
 
     # SPEED!: Use TF32
     torch.set_float32_matmul_precision("high") # Use TF32 on GPUs which support it
@@ -493,9 +487,9 @@ if __name__ == "__main__":
     model = GPT2(GPTConfig(vocab_size=50304, context_size=1024))
     # model = GPT2(GPTConfig()) # Baseline
     model.to(device)
-    # SPEED!: Torch Compile
-    if device_type == 'cuda':
-      model = torch.compile(model)
+    # # SPEED!: Torch Compile
+    # if device_type == 'cuda':
+    #   model = torch.compile(model)
 
     if ddp: # DDP
         model = DDP(model, device_ids=[ddp_local_rank])
@@ -503,8 +497,7 @@ if __name__ == "__main__":
 
     # Training
     losses = []
-    avg_losses = []
-    # moving_window_length = 200
+    val_losses = []
 
     if master_process:
         print(f"Training for {max_steps} steps")
@@ -514,8 +507,65 @@ if __name__ == "__main__":
     # IMPROVEMENTS: refactor optimizer into the model
     optimizer = raw_model.configure_optimizer(weight_decay=0.1, learning_rate=6e-4, device=device)
 
+    val_interval = 5
+    enc = tiktoken.get_encoding("gpt2")
+
     for step in range(max_steps):
         t0 = time.time()
+
+        # Once in a while, evaluate our validation loss
+        if step % val_interval == 0:
+            model.eval()
+            val_loss = calculate_validation_loss(model, val_loader, device, val_loss_steps=val_interval)
+            if master_process:
+                print(f"validation loss: {val_loss.item():.4f}")
+                val_losses.append(val_loss.item())
+        
+        # Once in a while generate some text completion with our model
+        if step % 20 and step != 0:
+          model.eval()
+          max_return_sequences = 4
+          max_length = 32
+
+          tokens = enc.encode("Hello, I am a program which")
+          tokens = torch.tensor(tokens, dtype=torch.long)
+          tokens = tokens.unsqueeze(0).repeat(max_return_sequences, 1)
+          x_gen = tokens.to(device)
+
+          while x_gen.size(1) < max_length:
+              with torch.no_grad():
+                  logits, loss = model(x_gen)  # (B, T, vocab_size)
+
+                  # take the logits of the last token
+                  logits = logits[:, -1, :]  # (B, vocab_size)
+
+                  # Get the probability distribution
+                  probs = F.softmax(logits, dim=-1)  # (B, vocab_size)
+
+                  # Sample the next token
+                  # top-k sampling of 50 tokens so we end up with (B, 50)
+                  top_k = 50
+                  topk_probs, topk_indices = torch.topk(probs, top_k, dim=-1)
+
+                  # select a token from the top-k probabilities
+                  next_token = torch.multinomial(topk_probs, 1)  # (B, 1)
+
+                  # Gather corresponding indices
+                  xcol = torch.gather(topk_indices, -1, next_token)
+
+                  # Append to the sequence
+                  debug_print(x_gen.shape, xcol.shape)
+                  x_gen = torch.cat((x_gen, xcol), dim=1)
+                  debug_print(x_gen.shape)
+
+          # Decode the tokens
+          for i in range(max_return_sequences):
+              tokens = x[i, :max_length].tolist()
+              decoded = enc.decode(tokens)
+              print(f"rank {ddp_rank} sample {i}: {decoded}")
+        
+        # Training Loop
+        model.train()
         optimizer.zero_grad()  # needed as pytorch accumulates gradients
         loss_accum = 0.0 # accumulate for microsteps for printing
         for microstep in range(grad_accum_steps):
@@ -559,56 +609,29 @@ if __name__ == "__main__":
 
         losses.append(loss_accum.item())
 
-        # if i % moving_window_length == 0:
-        #     # Calculate the average loss over the last n steps
-        #     with torch.no_grad():
-        #         last_n_losses = losses[-moving_window_length:]
-        #         avg_loss = (
-        #             sum(last_n_losses) / len(last_n_losses) if last_n_losses else 0
-        #         )
-        #         print(f"  ... step {i}, avg loss: {avg_loss}")
-        #         avg_losses.append(avg_loss)
-
     # Plot the loss
-    import matplotlib.pyplot as plt
 
-    plt.plot(losses)
-    # plt.plot(avg_losses)
+    # Create an array of x-values for the training loss
+    steps = np.arange(len(losses))
+    
+    # Create an array of x-values for the validation loss
+    val_steps = np.arange(0, len(losses), val_interval)
+    
+    # Ensure val_losses array matches the length of val_x
+    val_losses = val_losses[:len(val_steps)]
+    
+    plt.figure(figsize=(10, 6))
+    plt.plot(steps, losses, label='Training Loss')
+    plt.plot(val_steps, val_losses, label='Validation Loss')
+    
+    plt.xlabel('Steps')
+    plt.ylabel('Loss')
+    plt.title('Training and Validation Loss')
+    plt.legend()
+    
     plt.savefig("loss.png")
 
     if ddp:
         destroy_process_group()
 
     import sys; sys.exit(0)
-
-    # while x.size(1) < max_length:
-    #     with torch.no_grad():
-    #         logits = model(x)  # (B, T, vocab_size)
-
-    #         # take the logits of the last token
-    #         logits = logits[:, -1, :]  # (B, vocab_size)
-
-    #         # Get the probability distribution
-    #         probs = F.softmax(logits, dim=-1)  # (B, vocab_size)
-
-    #         # Sample the next token
-    #         # top-k sampling of 50 tokens so we end up with (B, 50)
-    #         top_k = 50
-    #         topk_probs, topk_indices = torch.topk(probs, top_k, dim=-1)
-
-    #         # select a token from the top-k probabilities
-    #         next_token = torch.multinomial(topk_probs, 1)  # (B, 1)
-
-    #         # Gather corresponding indices
-    #         xcol = torch.gather(topk_indices, -1, next_token)
-
-    #         # Append to the sequence
-    #         debug_print(x.shape, xcol.shape)
-    #         x = torch.cat((x, xcol), dim=1)
-    #         debug_print(x.shape)
-
-    # # Decode the tokens
-    # for i in range(max_return_sequences):
-    #     tokens = x[i, :max_length].tolist()
-    #     decoded = enc.decode(tokens)
-    #     print(">", decoded)
