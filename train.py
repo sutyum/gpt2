@@ -316,59 +316,100 @@ class GPT2(nn.Module):
         return optimizer
 
 
-def load_tokens(filename: str) -> torch.Tensor:
-    filename = os.path.join("/workspace/edu_fineweb10B", filename)
-    data = np.fromfile(filename, dtype=np.int32)
-    return torch.tensor(data, dtype=torch.long)
+def load_tokens(filename):
+    npt = np.load(filename)
+    npt = npt.astype(np.int32) # added after video
+    ptt = torch.tensor(npt, dtype=torch.long)
+    return ptt
 
+
+# class DataLoaderLite:
+#     def __init__(self, B, T, process_rank, num_processes, split):
+#         self.B = B  # batch size
+#         self.T = T  # context size
+#         self.process_rank = process_rank
+#         self.num_processes = num_processes
+
+#         assert split in {"train", "val"}, "The chosen split must be either train or split"
+
+#         # Get the shard filename
+#         data_root = os.path.join("/workspace", "edu_fineweb10B")
+#         shards = os.listdir(data_root)
+#         # print(shards)
+#         shards_for_split = [filename for filename in shards if split in filename]
+#         shards_for_split = sorted(shards_for_split)
+#         self.shards = shards_for_split # Shard file names for the given split
+
+#         assert len(shards) > 0, f"no shard found in split {split}"
+#         if master_process:
+#             print(f"Total number of shards in the split {split} is {len(shards)}")
+
+#         self.reset()
+    
+#     def reset(self):
+#         # state, init at shard zero
+#         self.current_shard = 0
+#         self.tokens = load_tokens(self.shards[self.current_shard])
+#         self.current_position = self.B * self.T * self.process_rank
+
+#     def next_batch(self) -> tuple[torch.Tensor, torch.Tensor]:
+#         B, T = self.B, self.T
+#         buf = self.tokens[self.current_position : self.current_position + B * T + 1]
+#         x = buf[:-1].view(B, T)  # Inputs
+#         y = buf[1:].view(B, T)  # Targets
+
+#         # advance the position in the tensor
+#         self.current_position += B * T * self.num_processes
+#         # if loading the next batch would be out of bounds, reset
+#         if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
+#             self.current_shard = (self.current_shard + 1) % len(self.shards)
+#             self.tokens = load_tokens(self.shards[self.current_shard])
+#             self.current_position = self.B * self.T * self.process_rank
+
+#         assert x.size() == y.size() == (B, T), "Size mismatch"
+
+#         return x, y
 
 class DataLoaderLite:
     def __init__(self, B, T, process_rank, num_processes, split):
-        self.B = B  # batch size
-        self.T = T  # context size
+        self.B = B
+        self.T = T
         self.process_rank = process_rank
         self.num_processes = num_processes
+        assert split in {'train', 'val'}
 
-        assert split in {"train", "val"}, "The chosen split must be either train or split"
-
-        # Get the shard filename
-        data_root = os.path.join("/workspace", "edu_fineweb10B")
+        # get the shard filenames
+        data_root = "edu_fineweb10B"
+        data_root = os.path.join("/workspace", data_root)
         shards = os.listdir(data_root)
-        # print(shards)
-        shards_for_split = [filename for filename in shards if split in filename]
-        shards_for_split = sorted(shards_for_split)
-        self.shards = shards_for_split # Shard file names for the given split
-
-        assert len(shards) > 0, f"no shard found in split {split}"
+        shards = [s for s in shards if split in s]
+        shards = sorted(shards)
+        shards = [os.path.join(data_root, s) for s in shards]
+        self.shards = shards
+        assert len(shards) > 0, f"no shards found for split {split}"
         if master_process:
-            print(f"Total number of shards in the split {split} is {len(shards)}")
-
+            print(f"found {len(shards)} shards for split {split}")
         self.reset()
-    
+
     def reset(self):
         # state, init at shard zero
         self.current_shard = 0
         self.tokens = load_tokens(self.shards[self.current_shard])
         self.current_position = self.B * self.T * self.process_rank
 
-    def next_batch(self) -> tuple[torch.Tensor, torch.Tensor]:
+    def next_batch(self):
         B, T = self.B, self.T
-        buf = self.tokens[self.current_position : self.current_position + B * T + 1]
-        x = buf[:-1].view(B, T)  # Inputs
-        y = buf[1:].view(B, T)  # Targets
-
+        buf = self.tokens[self.current_position : self.current_position+B*T+1]
+        x = (buf[:-1]).view(B, T) # inputs
+        y = (buf[1:]).view(B, T) # targets
         # advance the position in the tensor
         self.current_position += B * T * self.num_processes
-        # if loading the next batch would be out of bounds, reset
+        # if loading the next batch would be out of bounds, advance to next shard
         if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
             self.current_shard = (self.current_shard + 1) % len(self.shards)
             self.tokens = load_tokens(self.shards[self.current_shard])
-            self.current_position = self.B * self.T * self.process_rank
-
-        assert x.size() == y.size() == (B, T), "Size mismatch"
-
+            self.current_position = B * T * self.process_rank
         return x, y
-
 
 max_lr = 6e-4
 min_lr = max_lr * 0.1
