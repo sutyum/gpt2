@@ -87,3 +87,37 @@ Step 77 train loss: 6.7365
 Step 78 train loss: 6.7144
 Step 79 train loss: 6.6612
 Step 80 val loss: 6.7437
+80 hella 0.2456
+Step 80 train loss: 6.6671
+Step 81 train loss: 6.6879
+Step 82 train loss: 6.6323
+Step 83 train loss: 6.5929
+Step 84 train loss: 6.6122
+Step 85 train loss: 6.5795
+Step 86 train loss: 6.5776
+Step 87 train loss: 6.6040
+Step 88 train loss: 6.5970
+Step 89 train loss: 6.6405
+Step 90 train loss: 6.5763
+Step 91 train loss: 6.5793
+Step 92 train loss: 6.6269
+Step 93 train loss: 6.7048
+Step 94 train loss: 6.7147
+Step 95 train loss: 6.7114
+Step 96 train loss: 6.6669
+Step 97 train loss: 6.6292
+Step 98 train loss: 6.6737
+Step 99 train loss: 6.6370
+Step 100 val loss: 6.6292
+100 hella 0.2445
+Step 100 train loss: 6.6782
+Step 101 train loss: 6.6194
+Step 102 train loss: 6.6072
+Step 103 train loss: 6.5184
+Step 104 train loss: 6.6107
+Step 105 train loss: 6.6165
+Step 106 train loss: 6.5825
+Step 107 train loss: 6.5326
+Step 108 train loss: 6.5941
+Step 109 train loss: 6.6041
+Step 110 train loss: 6.5561
