@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import tiktoken
+import numpy as np
 
 
 debug = False
@@ -315,25 +316,39 @@ class GPT2(nn.Module):
         return optimizer
 
 
+def load_tokens(filename: str) -> torch.Tensor:
+    filename = os.path.join("/workspace/edu_fineweb10B", filename)
+    data = np.fromfile(filename, dtype=np.int32)
+    return torch.tensor(data, dtype=torch.long)
+
+
 class DataLoaderLite:
-    def __init__(self, B, T, process_rank, num_processes):
+    def __init__(self, B, T, process_rank, num_processes, split):
         self.B = B  # batch size
         self.T = T  # context size
         self.process_rank = process_rank
         self.num_processes = num_processes
 
-        with open("input.txt", "r") as f:
-            text = f.read()
+        assert split in {"train", "val"}, "The chosen split must be either train or split"
 
-        enc = tiktoken.get_encoding("gpt2")
-        tokens = enc.encode(text)
+        # Get the shard filename
+        data_root = os.path.join("/workspace", "edu_fineweb10B")
+        shards = os.listdir(data_root)
+        # print(shards)
+        shards_for_split = [filename for filename in shards if split in filename]
+        shards_for_split = sorted(shards_for_split)
+        self.shards = shards_for_split # Shard file names for the given split
 
-        self.tokens = torch.tensor(tokens)
+        assert len(shards) > 0, f"no shard found in split {split}"
+        if master_process:
+            print(f"Total number of shards in the split {split} is {len(shards)}")
 
-        if process_rank == 0:
-          print(f"loaded {len(self.tokens)} tokens")
-          print(f"1 epoch = {len(self.tokens) // (B * T)} batches")
-
+        self.reset()
+    
+    def reset(self):
+        # state, init at shard zero
+        self.current_shard = 0
+        self.tokens = load_tokens(self.shards[self.current_shard])
         self.current_position = self.B * self.T * self.process_rank
 
     def next_batch(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -346,7 +361,8 @@ class DataLoaderLite:
         self.current_position += B * T * self.num_processes
         # if loading the next batch would be out of bounds, reset
         if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
-            # print("\n\t!!! Dataset Loop Completed !!!\n")
+            self.current_shard = (self.current_shard + 1) % len(self.shards)
+            self.tokens = load_tokens(self.shards[self.current_shard])
             self.current_position = self.B * self.T * self.process_rank
 
         assert x.size() == y.size() == (B, T), "Size mismatch"
@@ -417,7 +433,7 @@ if __name__ == "__main__":
         torch.cuda.manual_seed(1337)
 
     total_batch_size = 524_288 # 2**19, ~0.5M tokens, GPT 2's batch size
-    B = 2 # micro batch size (can fit on this GPU)
+    B = 64 # micro batch size (can fit on this GPU)
     T = 1024 # sequence length
     assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B*T"
     grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
@@ -426,7 +442,7 @@ if __name__ == "__main__":
         print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
 
     # Instantiate the data loader
-    train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size)
+    train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train")
 
     # SPEED!: Use TF32
     torch.set_float32_matmul_precision("high") # Use TF32 on GPUs which support it
@@ -435,9 +451,9 @@ if __name__ == "__main__":
     model = GPT2(GPTConfig(vocab_size=50304, context_size=1024))
     # model = GPT2(GPTConfig()) # Baseline
     model.to(device)
-    # SPEED!: Torch Compile
-    if device_type == 'cuda':
-      model = torch.compile(model)
+    # # SPEED!: Torch Compile
+    # if device_type == 'cuda':
+    #   model = torch.compile(model)
 
     if ddp: # DDP
         model = DDP(model, device_ids=[ddp_local_rank])
